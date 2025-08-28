@@ -1,0 +1,58 @@
+#############################
+# Python / Build Artifacts  #
+#############################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+#############################
+# Virtual Environments      #
+#############################
+.venv/
+venv/
+env/
+ENV/
+
+#############################
+# OS / Editor               #
+#############################
+.DS_Store
+.vscode/
+*.swp
+*.swo
+
+#############################
+# Environment Files         #
+#############################
+.env
+.env.*
+
+#############################
+# Data Outputs (reproducible)
+#############################
+data/parsed/
+data/vectorstores/
+
+#############################
+# PDF Sources (keep folder)  #
+#############################
+tech_specs/*
+!tech_specs/.gitkeep
+
+#############################
+# Logs / Temp               #
+#############################
+*.log
+tmp/
+
+#############################
+# Notebooks (none yet)      #
+#############################
+.ipynb_checkpoints/
+
+# End

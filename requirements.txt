@@ -1,0 +1,14 @@
+langchain==0.2.14
+langchain-openai==0.1.23
+langchain-community==0.2.11
+faiss-cpu==1.8.0.post1
+tiktoken==0.7.0
+python-dotenv==1.0.1
+docling==2.48.0
+pydantic==2.11.7
+rich==14.1.0
+fastapi==0.111.1
+uvicorn==0.30.3
+orjson==3.10.6
+openai==1.42.0
+requests==2.32.3
