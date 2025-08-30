@@ -91,6 +91,12 @@ export OPENAI_TOKEN=sk-proj-...
   ```
 Return is a concise answer or `N/A` if not defensible from retrieved pages.
 
+7. Compare full PDFs (skip retrieval; feed entire parsed Markdown):
+  ```
+  python -m src.qa "List all features" br1-mini br1-mini-core --full-docs
+  ```
+  Useful for exhaustive feature/spec listings where coverage matters most.
+
 ---
 ## Performance & Accuracy Profiles
 - Real‑time (default): fast responses suitable for sales workflows
@@ -101,6 +107,10 @@ Return is a concise answer or `N/A` if not defensible from retrieved pages.
   - Set `disable_rerank=False`
   - Optionally increase `top_k_pages` to 7–8
   - Rerank runs in parallel batches with strict JSON schema for stability
+
+Coverage aids active in compare mode for feature/spec questions:
+- Query expansion: adds synonyms like features/specs/capabilities/functions.
+- Neighbor context: includes ±1 neighbor page when forming page text.
 
 Quick benchmarking:
 ```
@@ -132,17 +142,30 @@ python -m src.benchmark "your question" productA --runs 3 --full
 | answer_types | (Unused) future structured answer validation |
 | split_by | (Unused) future alternative splitting strategy |
 | cache_embeddings | In-memory hash caching during run |
+| auto_expand_features | Expand queries for feature/spec listings |
+| feature_expansion_terms | Synonyms used during expansion |
+| context_neighbor_pages | Include ±N neighbor pages in page text |
+| compare_accuracy_boost | Temporarily boost recall in compare() for features |
+| compare_full_docs_default | Make full‑doc compare the default |
+| max_full_doc_chars | Truncation limit when comparing full docs |
 Adjust and re-run parse/ingest if you change chunking or models.
 
 ---
 ## How Retrieval Works
 1. Vector similarity over chunks with scores.
 2. Group chunks by `page` (currently sequential index placeholder).
-3. Rank pages either by heuristic (default) or LLM rerank:
+3. Build page text from the page and its neighbors (±`context_neighbor_pages`).
+4. Rank pages either by heuristic (default) or LLM rerank:
    - Heuristic: 0.7·max(sim) + 0.3·mean(sim)
    - LLM rerank (optional): batched JSON‑schema scoring run in parallel
-4. Answer/compare using only the top pages; answers may be `N/A` if insufficient.
-5. For multi‑doc compare, retrieval runs per document independently; labeled blocks are merged for a single comparison prompt.
+5. Answer/compare using only the top pages; answers may be `N/A` if insufficient.
+6. For multi‑doc compare, retrieval runs per document independently; labeled blocks are merged for a single comparison prompt.
+
+Feature/spec listing boost:
+- For questions that look like lists of features/specs, retrieval expands the query with synonyms and unions results before ranking for higher coverage.
+
+Full‑doc compare mode:
+- `--full-docs` bypasses retrieval and feeds each document’s parsed Markdown (truncated by `max_full_doc_chars`) to the comparison prompt.
 
 ---
 ## Troubleshooting

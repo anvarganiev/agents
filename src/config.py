@@ -27,5 +27,16 @@ class RunConfig(BaseModel):
     parallel_compare: bool = True  # Retrieve docs in parallel during comparison
     max_compare_workers: int = 8  # Upper bound threads for comparison retrieval
     rerank_include_reasoning: bool = False  # If True, include reasoning in rerank JSON (slower & longer)
+    # Coverage aids for listing features/specs
+    auto_expand_features: bool = True  # Expand queries like "list all features"
+    feature_expansion_terms: tuple[str, ...] = (
+        "features", "feature", "capabilities", "functions", "specifications", "specs",
+        "options", "modes", "characteristics", "highlights", "support"
+    )
+    context_neighbor_pages: int = 1  # Include +/- N neighbor pages when building page text
+    compare_accuracy_boost: bool = True  # Temporarily boost recall in compare() for coverage
+    # Full-document comparison (skip retrieval; feed entire parsed Markdown per doc)
+    compare_full_docs_default: bool = False
+    max_full_doc_chars: int = 20000  # truncate when comparing full docs
 
 CONFIG = RunConfig()

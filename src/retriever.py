@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Iterable
 from dataclasses import dataclass
 
 from .embeddings import CustomOpenAIEmbeddings
@@ -57,14 +57,49 @@ def group_pages(chunks: List[Dict]) -> Dict[int, List[Dict]]:
     return pages
 
 
+def _combine_page_text(pages: Dict[int, List[Dict]], page: int, neighbor: int, limit_chars: int) -> str:
+    parts: List[str] = []
+    for p in range(page - neighbor, page + neighbor + 1):
+        if p in pages:
+            parts.extend(c['text'] for c in pages[p])
+    return "\n".join(parts)[:limit_chars]
+
+
+def is_feature_list_query(q: str) -> bool:
+    ql = q.lower()
+    keys = ("feature", "features", "spec", "specification", "capabilit", "function", "list")
+    return any(k in ql for k in keys)
+
+
+def expand_feature_queries(q: str) -> List[str]:
+    base = [q]
+    if not is_feature_list_query(q) or not CONFIG.auto_expand_features:
+        return base
+    # Add lightweight synonyms without extra LLM calls
+    ql = q.lower()
+    expansions = []
+    for term in CONFIG.feature_expansion_terms:
+        if term not in ql:
+            expansions.append(q.replace("features", term).replace("feature", term))
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for s in [q] + expansions:
+        key = s.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out[:6]  # cap expansions to control latency
+
+
 def llm_rerank(query: str, pages: Dict[int, List[Dict]]) -> List[RetrievedPage]:
     # Early exit if no pages
     if not pages:
         return []
 
     page_blocks: List[Dict] = []
-    for p, chs in pages.items():
-        combined = "\n".join(c['text'] for c in chs)[:CONFIG.max_page_chars]
+    for p, _chs in pages.items():
+        combined = _combine_page_text(pages, p, CONFIG.context_neighbor_pages, CONFIG.max_page_chars)
         page_blocks.append({"page": p, "text": combined})
 
     results: List[RetrievedPage] = []
@@ -106,10 +141,29 @@ def llm_rerank(query: str, pages: Dict[int, List[Dict]]) -> List[RetrievedPage]:
                 }
             }
         }
-        content = chat([
-            {"role": "system", "content": "Return a JSON array of {page:int, relevance:number}. No extra text."},
-            {"role": "user", "content": prompt_text}
-        ], model=CONFIG.llm_model, temperature=0, response_format=response_format)
+        # Call LLM with robust fallbacks to avoid bubbling exceptions
+        content = "[]"
+        try:
+            content = chat([
+                {"role": "system", "content": "Return a JSON array of {page:int, relevance:number}. No extra text."},
+                {"role": "user", "content": prompt_text}
+            ], model=CONFIG.llm_model, temperature=0, response_format=response_format)
+        except Exception:
+            # Fallback to simpler JSON mode
+            try:
+                content = chat([
+                    {"role": "system", "content": "Return only a JSON array of objects with 'page' and 'relevance'."},
+                    {"role": "user", "content": prompt_text}
+                ], model=CONFIG.llm_model, temperature=0, response_format={"type": "json_object"})
+            except Exception:
+                # Final fallback: ask without response_format and hope it's a JSON array
+                try:
+                    content = chat([
+                        {"role": "system", "content": "Return only JSON array with fields: page, relevance."},
+                        {"role": "user", "content": prompt_text}
+                    ], model=CONFIG.llm_model, temperature=0)
+                except Exception:
+                    return []
         out: List[RetrievedPage] = []
         try:
             data = json.loads(content)
@@ -141,14 +195,45 @@ def retrieve(query: str, doc_stem: str) -> List[RetrievedPage]:
         reranked = []  # force heuristic path
     else:
         reranked = llm_rerank(query, pages)
-    if not reranked:  # fallback if LLM failed
+    if not reranked:  # fallback if LLM disabled/failed
         # simple heuristic: sum similarity scores per page
         scored = []
         for p, chs in pages.items():
             # aggregate using max (strong signal) + mean (stability)
             sims = [c.get('sim', 0) for c in chs]
             score = 0.7 * max(sims) + 0.3 * (sum(sims) / len(sims))
-            text = "\n".join(c['text'] for c in chs)[:CONFIG.max_page_chars]
+            text = _combine_page_text(pages, p, CONFIG.context_neighbor_pages, CONFIG.max_page_chars)
+            scored.append(RetrievedPage(page=p, score=score, text=text, source='unknown'))
+        reranked = sorted(scored, key=lambda r: r.score, reverse=True)
+    return reranked[:CONFIG.top_k_pages]
+
+
+def retrieve_union(query: str, doc_stem: str) -> List[RetrievedPage]:
+    """Union retrieval across expanded queries, then rank pages (rerank or heuristic)."""
+    store_path = Path(CONFIG.store_dir) / doc_stem
+    queries = expand_feature_queries(query)
+    # Collect chunks from all queries and merge
+    all_chunks: List[Dict] = []
+    for q in queries:
+        all_chunks.extend(initial_chunk_search(q, store_path, k=CONFIG.top_k_initial))
+    # Deduplicate exact same chunk IDs if present
+    dedup: Dict[str, Dict] = {}
+    for ch in all_chunks:
+        cid = ch.get('id') or f"{ch.get('page')}-{hash(ch.get('text',''))}"
+        # keep the best similarity per chunk
+        if cid not in dedup or ch.get('sim', 0) > dedup[cid].get('sim', 0):
+            dedup[cid] = ch
+    pages = group_pages(list(dedup.values()))
+
+    # Optionally enable rerank for better coverage when doing expansions
+    use_rerank = not CONFIG.disable_rerank
+    reranked: List[RetrievedPage] = llm_rerank(query, pages) if use_rerank else []
+    if not reranked:
+        scored = []
+        for p, chs in pages.items():
+            sims = [c.get('sim', 0) for c in chs]
+            score = 0.7 * max(sims) + 0.3 * (sum(sims) / len(sims))
+            text = _combine_page_text(pages, p, CONFIG.context_neighbor_pages, CONFIG.max_page_chars)
             scored.append(RetrievedPage(page=p, score=score, text=text, source='unknown'))
         reranked = sorted(scored, key=lambda r: r.score, reverse=True)
     return reranked[:CONFIG.top_k_pages]
