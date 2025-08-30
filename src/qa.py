@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from typing import List
 from .retriever import retrieve
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import CONFIG
 from .openai_client import chat
 
@@ -48,17 +49,36 @@ def compare(question: str, doc_stems: List[str]) -> str:
     Each document's top pages are labeled and concatenated for a single LLM comparison prompt.
     """
     all_blocks: List[str] = []
-    for stem in doc_stems:
-        try:
-            pages = retrieve(question, stem)
-        except FileNotFoundError:
-            all_blocks.append(f"[DOC {stem}]\nN/A (vector store not found)")
-            continue
-        doc_block_parts: List[str] = []
-        for p in pages:
-            doc_block_parts.append(f"[PAGE {p.page}]\n{p.text}")
-        doc_block = f"[DOC {stem}]\n" + "\n\n".join(doc_block_parts) if doc_block_parts else f"[DOC {stem}]\nN/A (no relevant pages)"
-        all_blocks.append(doc_block)
+
+    if CONFIG.parallel_compare and len(doc_stems) > 1:
+        # Parallel retrieval per document
+        with ThreadPoolExecutor(max_workers=min(CONFIG.max_compare_workers, len(doc_stems))) as ex:
+            futures = {ex.submit(retrieve, question, stem): stem for stem in doc_stems}
+            for fut in as_completed(futures):
+                stem = futures[fut]
+                try:
+                    pages = fut.result()
+                    if not pages:
+                        all_blocks.append(f"[DOC {stem}]\nN/A (no relevant pages)")
+                        continue
+                    parts = [f"[PAGE {p.page}]\n{p.text}" for p in pages]
+                    all_blocks.append(f"[DOC {stem}]\n" + "\n\n".join(parts))
+                except FileNotFoundError:
+                    all_blocks.append(f"[DOC {stem}]\nN/A (vector store not found)")
+                except Exception as e:
+                    all_blocks.append(f"[DOC {stem}]\nError during retrieval: {e}")
+    else:
+        for stem in doc_stems:
+            try:
+                pages = retrieve(question, stem)
+            except FileNotFoundError:
+                all_blocks.append(f"[DOC {stem}]\nN/A (vector store not found)")
+                continue
+            doc_block_parts: List[str] = []
+            for p in pages:
+                doc_block_parts.append(f"[PAGE {p.page}]\n{p.text}")
+            doc_block = f"[DOC {stem}]\n" + "\n\n".join(doc_block_parts) if doc_block_parts else f"[DOC {stem}]\nN/A (no relevant pages)"
+            all_blocks.append(doc_block)
     context = "\n\n".join(all_blocks)
     prompt = COMPARE_PROMPT.format(question=question, context=context)
     return chat([

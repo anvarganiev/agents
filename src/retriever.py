@@ -8,6 +8,11 @@ from .embeddings import CustomOpenAIEmbeddings
 from .openai_client import chat
 from langchain_community.vectorstores import FAISS
 from .config import CONFIG
+from functools import lru_cache
+from threading import Lock
+
+# Thread-safe LRU load of vectorstores; FAISS.load_local is relatively expensive.
+_load_lock = Lock()
 
 
 @dataclass
@@ -18,15 +23,30 @@ class RetrievedPage:
     source: str
 
 
-def _load_vectorstore(store_path: Path):
+@lru_cache(maxsize=CONFIG.vector_cache_size)
+def _cached_store(path_str: str):
     embeddings = CustomOpenAIEmbeddings(model=CONFIG.embedding_model, api_key=os.getenv('OPENAI_TOKEN'))
-    return FAISS.load_local(str(store_path), embeddings, allow_dangerous_deserialization=True)
+    return FAISS.load_local(path_str, embeddings, allow_dangerous_deserialization=True)
+
+
+def _load_vectorstore(store_path: Path):
+    with _load_lock:  # defensive; FAISS load may not be fully thread-safe
+        return _cached_store(str(store_path))
 
 
 def initial_chunk_search(query: str, store_path: Path, k: int) -> List[Dict]:
     vs = _load_vectorstore(store_path)
-    docs = vs.similarity_search(query, k=k)
-    return [d.metadata | {'text': d.page_content, 'sim': d.metadata.get('score', 0)} for d in docs]
+    # Use scored search to enable stronger heuristic fallback when rerank is disabled/fails
+    docs_with_scores = vs.similarity_search_with_score(query, k=k)
+    # Convert FAISS distance (lower is better) to a normalized similarity score in [0,1]
+    chunks: List[Dict] = []
+    for d, dist in docs_with_scores:
+        try:
+            sim = 1.0 / (1.0 + float(dist))
+        except Exception:
+            sim = 0.0
+        chunks.append(d.metadata | {"text": d.page_content, "sim": sim})
+    return chunks
 
 
 def group_pages(chunks: List[Dict]) -> Dict[int, List[Dict]]:
@@ -38,28 +58,59 @@ def group_pages(chunks: List[Dict]) -> Dict[int, List[Dict]]:
 
 
 def llm_rerank(query: str, pages: Dict[int, List[Dict]]) -> List[RetrievedPage]:
-    # Build list of page blocks
-    page_blocks = []
-    for p, chs in pages.items():
-        text = "\n".join(c['text'] for c in chs)[:4000]
-        page_blocks.append({"page": p, "text": text})
+    # Early exit if no pages
+    if not pages:
+        return []
 
-    # Batch pages (optional; here simple all-at-once if small)
+    page_blocks: List[Dict] = []
+    for p, chs in pages.items():
+        combined = "\n".join(c['text'] for c in chs)[:CONFIG.max_page_chars]
+        page_blocks.append({"page": p, "text": combined})
+
     results: List[RetrievedPage] = []
-    BATCH = CONFIG.rerank_batch_pages
+    BATCH = CONFIG.rerank_batch_pages or 1
+    # Build batches and run in parallel for speed
+    batches = []
     for i in range(0, len(page_blocks), BATCH):
-        batch = page_blocks[i:i+BATCH]
+        batch = page_blocks[i:i + BATCH]
         blocks_text = "\n\n".join([f"[PAGE {b['page']}]\n{b['text']}" for b in batch])
+        reasoning_field = ", \"reasoning\": {\"type\": \"string\"}" if CONFIG.rerank_include_reasoning else ""
         prompt = (
-            "You are a retrieval relevance scorer. Given a user query and several PAGE blocks, "
-            "return ONLY a JSON array, each element: {\"page\": <int>, \"relevance\": <float 0-1>, \"reasoning\": <short justification>}. "
-            "Be strict: 0 = irrelevant, 1 = perfectly answers.\n\n"
+            "You are a retrieval relevance scorer. Given a user query and multiple PAGE blocks, "
+            "score each page for relevance. Be strict: 0 = irrelevant, 1 = perfectly answers.\n\n"
             f"Query: {query}\n---\nPAGE BLOCKS:\n{blocks_text}\n"
         )
+        batches.append((batch, prompt))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _call(batch_and_prompt):
+        batch, prompt_text = batch_and_prompt
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "PageRelevanceList",
+                "strict": True,
+                "schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "page": {"type": "integer"},
+                            "relevance": {"type": "number"},
+                            "reasoning": {"type": "string"}
+                        },
+                        "required": ["page", "relevance"],
+                        "additionalProperties": False
+                    }
+                }
+            }
+        }
         content = chat([
-            {"role": "system", "content": "Return only JSON array."},
-            {"role": "user", "content": prompt}
-        ], model=CONFIG.llm_model, temperature=0)
+            {"role": "system", "content": "Return a JSON array of {page:int, relevance:number}. No extra text."},
+            {"role": "user", "content": prompt_text}
+        ], model=CONFIG.llm_model, temperature=0, response_format=response_format)
+        out: List[RetrievedPage] = []
         try:
             data = json.loads(content)
             if isinstance(data, list):
@@ -67,9 +118,17 @@ def llm_rerank(query: str, pages: Dict[int, List[Dict]]) -> List[RetrievedPage]:
                     pnum = obj.get('page')
                     rel = float(obj.get('relevance', 0))
                     page_text = next((b['text'] for b in batch if b['page'] == pnum), '')
-                    results.append(RetrievedPage(page=pnum, score=rel, text=page_text, source='unknown'))
+                    out.append(RetrievedPage(page=pnum, score=rel, text=page_text, source='unknown'))
         except Exception:
-            continue
+            pass
+        return out
+
+    with ThreadPoolExecutor(max_workers=min(CONFIG.max_concurrency, max(1, len(batches)))) as ex:
+        futures = [ex.submit(_call, b) for b in batches]
+        for fut in as_completed(futures):
+            for item in fut.result():
+                results.append(item)
+
     return sorted(results, key=lambda r: r.score, reverse=True)
 
 
@@ -77,13 +136,19 @@ def retrieve(query: str, doc_stem: str) -> List[RetrievedPage]:
     store_path = Path(CONFIG.store_dir) / doc_stem
     chunks = initial_chunk_search(query, store_path, k=CONFIG.top_k_initial)
     pages = group_pages(chunks)
-    reranked = llm_rerank(query, pages)
+    reranked: List[RetrievedPage]
+    if CONFIG.disable_rerank:
+        reranked = []  # force heuristic path
+    else:
+        reranked = llm_rerank(query, pages)
     if not reranked:  # fallback if LLM failed
         # simple heuristic: sum similarity scores per page
         scored = []
         for p, chs in pages.items():
-            score = max(c.get('sim', 0) for c in chs)
-            text = "\n".join(c['text'] for c in chs)[:4000]
+            # aggregate using max (strong signal) + mean (stability)
+            sims = [c.get('sim', 0) for c in chs]
+            score = 0.7 * max(sims) + 0.3 * (sum(sims) / len(sims))
+            text = "\n".join(c['text'] for c in chs)[:CONFIG.max_page_chars]
             scored.append(RetrievedPage(page=p, score=score, text=text, source='unknown'))
         reranked = sorted(scored, key=lambda r: r.score, reverse=True)
     return reranked[:CONFIG.top_k_pages]

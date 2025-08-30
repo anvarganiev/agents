@@ -15,13 +15,15 @@ class CustomOpenAIEmbeddings(Embeddings):
         self.timeout = timeout
         self.max_retries = max_retries
         self.url = "https://api.openai.com/v1/embeddings"
+        # Single session for connection pooling
+        self._session = requests.Session()
 
     def _request(self, texts: List[str]) -> List[List[float]]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {"model": self.model, "input": texts}
         for attempt in range(self.max_retries):
             try:
-                resp = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
+                resp = self._session.post(self.url, json=payload, headers=headers, timeout=self.timeout)
                 if resp.status_code == 200:
                     data = resp.json()["data"]
                     return [d["embedding"] for d in data]
@@ -41,8 +43,7 @@ class CustomOpenAIEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:  # type: ignore[override]
         return self._request([text])[0]
 
-    def __call__(self, texts: List[str]) -> List[List[float]]:
-        # Some vectorstores may still call embedding_function(list_of_texts)
-        if isinstance(texts, str):  # defensive
+    def __call__(self, texts: List[str]) -> List[List[float]]:  # legacy compatibility
+        if isinstance(texts, str):
             return [self.embed_query(texts)]
         return self._request(texts)
